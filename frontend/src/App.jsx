@@ -107,7 +107,11 @@ const DEFAULTS = {
 
 const fmt = (n) => (n == null ? "—" : Number(n).toLocaleString("en-IN", { maximumFractionDigits: 2 }));
 
-const API_BASE = (import.meta.env.VITE_API_BASE || "").replace(/\/$/, "");
+const API_BASE = (
+  (typeof process !== "undefined" && process.env?.BACKEND_URL) ||
+  import.meta.env.VITE_API_BASE ||
+  ""
+).replace(/\/$/, "");
 
 async function api(path, options = {}) {
   const targetUrl = path.startsWith("http") ? path : `${API_BASE}${path}`;
