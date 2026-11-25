@@ -72,7 +72,13 @@ const PATTERN_OPTIONS = [
 ];
 
 const DEFAULTS = {
-  // Trendlines
+  // Multi-Touch Trendlines (Technical Specification)
+  trendline_k: 4,
+  min_touches: 3,
+  volume_multiplier: 1.5,
+  breach_tolerance: 0.10,
+  touch_tolerance: 0.25,
+  max_wick_breaches: 2,
   swing_period: 30,
   min_pivot_gap: 10,
   min_right_bars: 3,
@@ -245,7 +251,8 @@ function LineChart({ data, techniques = ["pattern", "trendline", "sma", "rsi"], 
   }
 
   // Extended trendline in both directions
-  const resLine = data.analysis?.resistance_line;
+  const resLine = data.analysis?.resistance_line || data.analysis?.support_line;
+  const isSupport = data.analysis?.support_line && !data.analysis?.resistance_line;
   const trendlinePath = useMemo(() => {
     if (!hasTrendline || !resLine || !resLine.start || !resLine.end) return null;
     const x0 = x(0);
@@ -256,9 +263,9 @@ function LineChart({ data, techniques = ["pattern", "trendline", "sma", "rsi"], 
   }, [hasTrendline, resLine, candles.length, hi, lo]);
 
   const swingHighs = hasTrendline
-    ? (data.analysis?.swing_highs || [])
+    ? (data.analysis?.swing_highs?.length ? data.analysis.swing_highs : data.analysis?.swing_lows || [])
         .filter((p) => absIndex(p.index) >= 0 && absIndex(p.index) < candles.length)
-        .map((p, idx) => ({ ...p, i: absIndex(p.index), label: `P${idx + 1}` }))
+        .map((p, idx) => ({ ...p, i: absIndex(p.index), label: p.label || `P${idx + 1}` }))
     : [];
 
   const annotatedPatterns = hasPattern
@@ -321,13 +328,47 @@ function LineChart({ data, techniques = ["pattern", "trendline", "sma", "rsi"], 
       {/* Trendline Overlays */}
       {hasTrendline && (
         <>
-          {trendlinePath && <path d={trendlinePath} className="trend-resistance-extended" />}
+          {trendlinePath && (
+            <path
+              d={trendlinePath}
+              className={isSupport ? "trend-support-extended" : "trend-resistance-extended"}
+            />
+          )}
           {swingHighs.map((p) => (
-            <g key={`h${p.index}`}>
-              <circle cx={x(p.i)} cy={y(p.price)} r="4.5" className="pivot-high-body" />
-              <text x={x(p.i)} y={y(p.price) - 8} className="pivot-badge-label" textAnchor="middle">{p.label}</text>
+            <g key={`h${p.index}-${p.i}`}>
+              <circle
+                cx={x(p.i)}
+                cy={y(p.price)}
+                r={p.is_anchor ? "5.5" : "4.0"}
+                className={p.is_anchor ? "anchor-pivot" : "touch-pivot"}
+              />
+              <text x={x(p.i)} y={y(p.price) - 8} className="pivot-badge-label" textAnchor="middle">
+                {p.label}
+              </text>
             </g>
           ))}
+          {/* Confirmed Breakout / Breakdown Events */}
+          {(data.analysis?.signals || []).map((sig, sIdx) => {
+            const absI = absIndex(sig.bar_index);
+            if (absI < 0 || absI >= candles.length) return null;
+            const cx = x(absI);
+            const cy = y(sig.line_price || sig.close_price || candles[absI].high);
+            const isBull = sig.type === "long_breakout" || sig.type === "breakout";
+            return (
+              <g key={`bo-marker-${absI}-${sIdx}`}>
+                <polygon
+                  points={`${cx},${cy - 8} ${cx - 5},${cy - 18} ${cx + 5},${cy - 18}`}
+                  fill={isBull ? "#16a34a" : "#dc2626"}
+                  stroke={isBull ? "#14532d" : "#7f1d1d"}
+                  strokeWidth="1"
+                  className="breakout-badge-poly"
+                />
+                <text x={cx} y={cy - 21} textAnchor="middle" fontSize="9" fontWeight="800" fill={isBull ? "#15803d" : "#b91c1c"}>
+                  {isBull ? "BREAKOUT" : "BREAKDOWN"}
+                </text>
+              </g>
+            );
+          })}
         </>
       )}
 
@@ -1872,54 +1913,74 @@ export default function App() {
           {techniques.includes("trendline") && (
             <div style={{ marginTop: "14px", padding: "14px", background: "#f8faf9", borderRadius: "10px", border: "1px solid #e1e9e3" }}>
               <div style={{ marginBottom: "10px" }}>
-                <strong style={{ fontSize: "12px", color: "#164638" }}>02. Swing Trendline Settings</strong>
+                <strong style={{ fontSize: "12px", color: "#164638" }}>02. Multi-Touch Trendline & Breakout Detector Settings</strong>
               </div>
               <div className="controls-grid" style={{ padding: "0 0 6px" }}>
                 <SliderField
-                  label="Swing Period (Highest Swing in N Candles)"
-                  sublabel="Body tip higher than N prior/next bars"
+                  label="Pivot Half-Window (k)"
+                  sublabel="Bars on each side to define swing highs/lows"
                   min={2}
-                  max={80}
-                  value={params.swing_period}
-                  onChange={(val) => setParams({ ...params, swing_period: val })}
+                  max={12}
+                  value={params.trendline_k ?? 4}
+                  onChange={(val) => setParams({ ...params, trendline_k: val })}
                   unit=" bars"
                 />
                 <SliderField
-                  label="Min Pivot Gap (Between Two Swings)"
-                  sublabel="Gap before checking next swing point"
-                  min={1}
+                  label="Min Touches Along Envelope (N_touches)"
+                  sublabel="Validated touches required (default 3)"
+                  min={2}
+                  max={6}
+                  value={params.min_touches ?? 3}
+                  onChange={(val) => setParams({ ...params, min_touches: val })}
+                  unit=" touches"
+                />
+                <SliderField
+                  label="Breakout Volume Surge (λ_vol)"
+                  sublabel="Volume on breakout bar ≥ λ_vol × SMA20(V)"
+                  min={1.0}
+                  max={3.0}
+                  step={0.1}
+                  value={params.volume_multiplier ?? 1.5}
+                  onChange={(val) => setParams({ ...params, volume_multiplier: val })}
+                  unit="x"
+                />
+                <SliderField
+                  label="Body Breach Tolerance (γ)"
+                  sublabel="Allowed body overshoot beyond line in ATR units"
+                  min={0.02}
+                  max={0.30}
+                  step={0.02}
+                  value={params.breach_tolerance ?? 0.10}
+                  onChange={(val) => setParams({ ...params, breach_tolerance: val })}
+                  unit=" ATR"
+                />
+                <SliderField
+                  label="Touch Tolerance Band (α)"
+                  sublabel="Half-width in ATR units to qualify as touch"
+                  min={0.10}
+                  max={0.50}
+                  step={0.05}
+                  value={params.touch_tolerance ?? 0.25}
+                  onChange={(val) => setParams({ ...params, touch_tolerance: val })}
+                  unit=" ATR"
+                />
+                <SliderField
+                  label="Max Tolerated Wick Breaches"
+                  sublabel="Max allowed wick spikes beyond envelope"
+                  min={0}
+                  max={5}
+                  value={params.max_wick_breaches ?? 2}
+                  onChange={(val) => setParams({ ...params, max_wick_breaches: val })}
+                  unit=" spikes"
+                />
+                <SliderField
+                  label="Min Anchor Gap (Δt_min)"
+                  sublabel="Minimum bars separating anchor pivots"
+                  min={5}
                   max={50}
                   value={params.min_pivot_gap}
                   onChange={(val) => setParams({ ...params, min_pivot_gap: val })}
                   unit=" bars"
-                />
-                <SliderField
-                  label="Min Candles Away from Current Price"
-                  sublabel="Bars before current price to confirm swing high"
-                  min={1}
-                  max={30}
-                  value={params.min_right_bars}
-                  onChange={(val) => setParams({ ...params, min_right_bars: val })}
-                  unit=" bars"
-                />
-                <SliderField
-                  label="Pivot Depth Window (N Bars Before & After)"
-                  sublabel="Bars before & after pivot to check lowest price"
-                  min={1}
-                  max={50}
-                  value={params.pivot_depth_bars}
-                  onChange={(val) => setParams({ ...params, pivot_depth_bars: val })}
-                  unit=" bars"
-                />
-                <SliderField
-                  label="Min Pivot Price Drop (x% Below Pivot)"
-                  sublabel="Lowest price must be at least x% less than pivot body"
-                  min={0.0}
-                  max={20.0}
-                  step={0.5}
-                  value={params.pivot_depth_pct}
-                  onChange={(val) => setParams({ ...params, pivot_depth_pct: val })}
-                  unit="%"
                 />
                 <SliderField
                   label="Trendline Breakout Window"
@@ -1929,6 +1990,34 @@ export default function App() {
                   value={params.trendline_window}
                   onChange={(val) => setParams({ ...params, trendline_window: val, signal_window: val })}
                   unit=" bars"
+                />
+                <SliderField
+                  label="Min Clearance From Current Price"
+                  sublabel="Bars before current price to confirm pivot"
+                  min={1}
+                  max={30}
+                  value={params.min_right_bars}
+                  onChange={(val) => setParams({ ...params, min_right_bars: val })}
+                  unit=" bars"
+                />
+                <SliderField
+                  label="Pivot Depth Window (N Bars)"
+                  sublabel="Bars before & after pivot to check lowest price"
+                  min={1}
+                  max={50}
+                  value={params.pivot_depth_bars}
+                  onChange={(val) => setParams({ ...params, pivot_depth_bars: val })}
+                  unit=" bars"
+                />
+                <SliderField
+                  label="Min Pivot Price Drop (x% Below Pivot)"
+                  sublabel="Lowest price must drop x% below pivot"
+                  min={0.0}
+                  max={20.0}
+                  step={0.5}
+                  value={params.pivot_depth_pct}
+                  onChange={(val) => setParams({ ...params, pivot_depth_pct: val })}
+                  unit="%"
                 />
               </div>
             </div>
@@ -2309,8 +2398,9 @@ export default function App() {
                   )}
                   {techniques.includes("trendline") && (
                     <>
-                      <span><i className="legend-trendline-ext" />Extended Trendline</span>
-                      <span><i className="legend-pivot-marker" />Body Tip Pivot (P1, P2)</span>
+                      <span><i className="legend-trendline-ext" />Multi-Touch Trendline</span>
+                      <span><i style={{ width: 8, height: 8, borderRadius: "50%", background: "#e11d48", display: "inline-block" }} />Anchor Pivot (P*)</span>
+                      <span><i style={{ width: 7, height: 7, borderRadius: "50%", background: "#2563eb", display: "inline-block" }} />Touch Point (P)</span>
                     </>
                   )}
                   {techniques.includes("pattern") && (
@@ -2363,10 +2453,24 @@ export default function App() {
                     );
                   })()}
                   {techniques.includes("trendline") && (
-                    <div>
-                      <small>Trendline Level</small>
-                      <b>{chart.analysis.resistance ? `₹${fmt(chart.analysis.resistance)}` : "—"}</b>
-                    </div>
+                    <>
+                      <div>
+                        <small>Trendline Level</small>
+                        <b>{chart.analysis.resistance ? `₹${fmt(chart.analysis.resistance)}` : (chart.analysis.support ? `₹${fmt(chart.analysis.support)}` : "—")}</b>
+                      </div>
+                      <div>
+                        <small>Touches / Anchors</small>
+                        <b style={{ color: "#2563eb" }}>
+                          {chart.analysis.resistance_line?.touch_count || chart.analysis.touch_count || 0} touches ({chart.analysis.resistance_line?.anchor_bars?.length || 2} anchors)
+                        </b>
+                      </div>
+                      <div>
+                        <small>Structure Score S(m,c)</small>
+                        <b style={{ color: "#059669" }}>
+                          {chart.analysis.resistance_line?.score != null ? chart.analysis.resistance_line.score : "—"}
+                        </b>
+                      </div>
+                    </>
                   )}
                   {techniques.includes("pattern") && (
                     <div>

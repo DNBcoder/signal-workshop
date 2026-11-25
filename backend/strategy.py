@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any
 
+from trendline_detector import analyze_multi_touch_trendlines
+
 
 def _day(d: Any) -> str:
     if isinstance(d, datetime):
@@ -373,13 +375,20 @@ def analyze_candles(
     min_right_bars: int = 3,
     pivot_depth_bars: int = 5,
     pivot_depth_pct: float = 2.0,
+    trendline_k: int | None = None,
+    min_touches: int = 3,
+    breach_tolerance: float = 0.10,
+    touch_tolerance: float = 0.25,
+    max_wick_breaches: int = 2,
+    volume_multiplier: float = 1.5,
     **kwargs: Any,
 ) -> dict[str, Any]:
-    """Candlestick body-tip trendline analysis.
-    - Picks swing highs closest to the current date that have already fallen back down.
-    - Enforces depth condition: price lowest within N bars before and after must drop by >= x%.
-    - Draws trendline passing through body tips extended in both directions.
-    - Accurately identifies the TRUE historical breakout date when price first crossed above the line after P2.
+    """Multi-Touch Diagonal Trendline & Breakout Detector (Technical Specification).
+    - Constrained boundary envelope (No-Violation Rule for candle bodies)
+    - Scale-invariant ATR-normalized slope filter
+    - Volatility-normalized touch counting with cluster spacing (N_touches >= 3)
+    - Composite structural quality scoring S(m, c)
+    - Volume-confirmed decisive breakout detection at t_now or recent window
     """
     if "strength" in kwargs and swing_period == 40:
         swing_period = int(kwargs["strength"])
@@ -387,29 +396,70 @@ def analyze_candles(
     if len(candles) > lookback_candles:
         candles = candles[-lookback_candles:]
 
-    min_required = swing_period + min_right_bars + 1
-    if len(candles) < min_required:
-        raise ValueError(f"Need at least {min_required} candles for swing period {swing_period} (have {len(candles)}).")
+    if len(candles) < 25:
+        raise ValueError(f"Need at least 25 candles for multi-touch trendline analysis (have {len(candles)}).")
 
-    swing_highs = find_body_swing_highs(
+    # Determine k (pivot half-window)
+    if trendline_k is not None and trendline_k >= 2:
+        k_val = trendline_k
+    elif swing_period <= 8:
+        k_val = max(2, swing_period)
+    else:
+        k_val = max(3, min(6, swing_period // 6))
+
+    min_space = max(5, min_pivot_gap)
+    lookback_w = min(len(candles) - 1, max(60, min(lookback_candles, 180)))
+
+    # Run multi-touch trendline detector
+    res = analyze_multi_touch_trendlines(
         candles,
-        swing_period=swing_period,
-        min_gap=min_pivot_gap,
-        min_right_bars=min_right_bars,
-        pivot_depth_bars=pivot_depth_bars,
-        pivot_depth_pct=pivot_depth_pct,
+        direction="BOTH",
+        k=k_val,
+        lookback_window=lookback_w,
+        min_anchor_spacing=min_space,
+        min_norm_slope=0.05,
+        max_norm_slope=0.40,
+        breach_tolerance=breach_tolerance,
+        max_wick_breaches=max_wick_breaches,
+        touch_tolerance=touch_tolerance,
+        min_touch_spacing=5,
+        min_touches=min_touches,
+        breakout_buffer=0.25,
+        volume_multiplier=volume_multiplier,
+        trendline_window=signal_window,
     )
-    last_index = len(candles) - 1
+
+    # Fallback to min_touches=2 if 3 touches were not found
+    if res.get("selected") is None and min_touches > 2:
+        res = analyze_multi_touch_trendlines(
+            candles,
+            direction="BOTH",
+            k=k_val,
+            lookback_window=lookback_w,
+            min_anchor_spacing=min_space,
+            min_norm_slope=0.05,
+            max_norm_slope=0.40,
+            breach_tolerance=breach_tolerance,
+            max_wick_breaches=max_wick_breaches,
+            touch_tolerance=touch_tolerance,
+            min_touch_spacing=5,
+            min_touches=2,
+            breakout_buffer=0.25,
+            volume_multiplier=volume_multiplier,
+            trendline_window=signal_window,
+        )
+
     last = candles[-1]
     previous = candles[-2] if len(candles) > 1 else last
     curr_close = float(last["close"])
     prev_close = float(previous["close"])
 
-    if len(swing_highs) < 2:
+    selected = res.get("selected")
+    if not selected:
         status_msg = (
-            f"No trendline: None fulfilled pivot conditions (found {len(swing_highs)}, need 2 with {swing_period}b radius & -{pivot_depth_pct}% depth in ±{pivot_depth_bars}b)."
-            if len(swing_highs) == 0
-            else f"No trendline: Only 1 pivot fulfilled conditions (need at least 2 meeting ±{pivot_depth_bars}b, -{pivot_depth_pct}% depth)."
+            f"No trendline: No candidate lines met envelope & touch constraints "
+            f"(k={k_val}, min touches: {min_touches}, breach tol: {breach_tolerance} ATR, "
+            f"max wick breaches: {max_wick_breaches})."
         )
         return {
             "last_date": _day(last["date"]),
@@ -419,99 +469,65 @@ def analyze_candles(
             "support": None,
             "resistance_line": None,
             "support_line": None,
-            "swing_highs": swing_highs,
-            "all_swing_highs": swing_highs,
+            "swing_highs": [],
+            "all_swing_highs": [],
             "swing_lows": [],
             "signals": [],
             "latest_signal": None,
             "status_text": status_msg,
             "distance_pct": None,
             "is_broken_out": False,
+            "is_recent_breakout": False,
+            "multi_touch_meta": None,
         }
 
-    # Choose the swing highs closest to the current date (the last 2 chronologically)
-    p1 = swing_highs[-2]
-    p2 = swing_highs[-1]
-    p3 = swing_highs[-3] if len(swing_highs) >= 3 else None
-    selected_pivots = [p3, p1, p2] if p3 is not None else [p1, p2]
+    # Format touch points as swing highs with P1, P2... labels for SVG chart
+    touches = selected.get("touches", [])
+    swing_pivots = []
+    for idx, pt in enumerate(touches):
+        swing_pivots.append({
+            "index": pt["index"],
+            "date": pt["date"],
+            "price": pt["price"],
+            "high": pt["price"],
+            "low": pt["price"],
+            "open": pt["price"],
+            "close": pt["price"],
+            "label": f"P{idx + 1}" + ("*" if pt.get("is_anchor") else ""),
+            "is_anchor": pt.get("is_anchor", False),
+            "bars_ago": len(candles) - 1 - pt["index"],
+        })
 
-    trendline = _trendline_payload(p1, p2, len(candles), candles, p3)
-    slope = trendline["slope_per_bar"]
+    curr_line = selected["projected_price"]
+    is_res = selected["direction"] == "DESCENDING_RESISTANCE"
+    is_broken_out = curr_close > curr_line if is_res else curr_close < curr_line
 
-    def line_at(idx: int) -> float:
-        return p1["price"] + slope * (idx - p1["index"])
-
-    curr_line = line_at(last_index)
-
-    # Search for the TRUE initial breakout date strictly AFTER P2
-    breakout_event: dict[str, Any] | None = None
-    all_crossings: list[dict[str, Any]] = []
-
-    for k in range(p2["index"] + 1, len(candles)):
-        line_prev = line_at(k - 1)
-        line_curr = line_at(k)
-        c_prev = float(candles[k - 1]["close"])
-        c_curr = float(candles[k]["close"])
-
-        # Close crossed above the trendline
-        if c_prev <= line_prev and c_curr > line_curr:
-            pct = ((c_curr - line_curr) / line_curr) * 100
-            crossing = {
-                "type": "breakout",
-                "date": _day(candles[k]["date"]),
-                "close": c_curr,
-                "line": line_curr,
-                "breakout_pct": round(pct, 2),
-                "bars_ago": len(candles) - 1 - k,
-                "bar_index": k,
-            }
-            all_crossings.append(crossing)
-            if breakout_event is None:
-                # Capture the initial breakout bar
-                breakout_event = crossing
-
-    # If multiple crossings occurred (e.g. pullback and re-breakout), latest crossing is also available
-    latest_crossing = all_crossings[-1] if all_crossings else None
-
-    # Current position relative to the trendline
-    is_currently_above = curr_close > curr_line
     dist_pct = round(((curr_line - curr_close) / curr_close) * 100, 2) if curr_close > 0 else 0.0
-    above_pct = round(((curr_close - curr_line) / curr_line) * 100, 2) if curr_line > 0 else 0.0
 
-    # Determine active signal within signal_window:
-    # A signal is considered a recent breakout if it crossed within signal_window bars
-    is_recent_breakout = bool(
-        latest_crossing and (latest_crossing["bars_ago"] <= signal_window)
-    )
-
-    if latest_crossing:
-        if is_currently_above:
-            status_text = f"Breakout on {latest_crossing['date']} ({latest_crossing['bars_ago']}b ago, +{above_pct}%)"
-        else:
-            status_text = f"Broke out on {latest_crossing['date']}, now retesting ({dist_pct}% below)"
-    else:
-        status_text = f"{dist_pct}% below trendline"
-
-    # The signal object reported: contains the true crossover date!
-    signal_to_report = latest_crossing if latest_crossing else None
+    breakout_events = res.get("breakout_events", [])
+    latest_sig = res.get("latest_breakout")
+    is_recent_breakout = res.get("is_recent_breakout", False)
 
     return {
         "last_date": _day(last["date"]),
         "close": curr_close,
         "previous_close": prev_close,
-        "resistance": curr_line,
-        "support": None,
-        "resistance_line": trendline,
-        "support_line": None,
-        "swing_highs": selected_pivots,
-        "all_swing_highs": swing_highs,
-        "swing_lows": [],
-        "signals": all_crossings,
-        "latest_signal": signal_to_report,
+        "resistance": curr_line if is_res else None,
+        "support": curr_line if not is_res else None,
+        "resistance_line": selected if is_res else None,
+        "support_line": selected if not is_res else res.get("support"),
+        "swing_highs": swing_pivots if is_res else [],
+        "swing_lows": swing_pivots if not is_res else [],
+        "all_swing_highs": swing_pivots,
+        "signals": breakout_events,
+        "latest_signal": latest_sig,
         "is_recent_breakout": is_recent_breakout,
         "distance_pct": dist_pct,
-        "is_broken_out": is_currently_above,
-        "status_text": status_text,
+        "is_broken_out": is_broken_out,
+        "status_text": res.get("status_text", ""),
+        "multi_touch_meta": selected,
+        "touch_count": selected.get("touch_count", 0),
+        "score": selected.get("score", 0.0),
     }
 
 
@@ -821,6 +837,12 @@ def analyze_confluence(
     min_right_bars: int = 3,
     pivot_depth_bars: int = 5,
     pivot_depth_pct: float = 2.0,
+    trendline_k: int = 4,
+    min_touches: int = 3,
+    breach_tolerance: float = 0.10,
+    touch_tolerance: float = 0.25,
+    max_wick_breaches: int = 2,
+    volume_multiplier: float = 1.5,
     # Candlestick Pattern settings
     pattern_window: int = 10,
     pattern_filter: str | list[str] = "all",
@@ -839,7 +861,7 @@ def analyze_confluence(
     rsi_window: int = 10,
     rsi_rule: str = "any_bullish",
 ) -> dict[str, Any]:
-    """Scan and mix multiple techniques: Trendline Breakout, Candlestick Patterns, SMA Crossover, and RSI.
+    """Scan and mix multiple techniques: Multi-Touch Trendline Breakout, Candlestick Patterns, SMA Crossover, and RSI.
     Supports matching ALL enabled techniques (Strict Confluence) or ANY enabled technique.
     """
     if not enabled_techniques:
@@ -863,18 +885,26 @@ def analyze_confluence(
                 min_right_bars=min_right_bars,
                 pivot_depth_bars=pivot_depth_bars,
                 pivot_depth_pct=pivot_depth_pct,
+                trendline_k=trendline_k,
+                min_touches=min_touches,
+                breach_tolerance=breach_tolerance,
+                touch_tolerance=touch_tolerance,
+                max_wick_breaches=max_wick_breaches,
+                volume_multiplier=volume_multiplier,
             )
             is_breakout = trendline_res.get("is_recent_breakout", False)
             matches["trendline"] = is_breakout
             if is_breakout and trendline_res.get("latest_signal"):
                 sig = trendline_res["latest_signal"]
+                v_ratio = sig.get("volume_ratio", 1.0)
+                t_count = trendline_res.get("touch_count", 0)
                 matched_badges.append({
                     "tech": "trendline",
                     "type": "breakout",
                     "label": "Trendline Breakout",
                     "date": sig.get("date"),
                     "bars_ago": sig.get("bars_ago", 0),
-                    "details": f"+{sig.get('breakout_pct', 0)}% above line",
+                    "details": f"+{sig.get('breakout_pct', 0)}% | {t_count} touches | Vol: {v_ratio}x",
                 })
         except Exception:
             matches["trendline"] = False
@@ -988,11 +1018,14 @@ def analyze_confluence(
         "status_text": status_text,
         # Trendline overlay
         "resistance_line": trendline_res.get("resistance_line"),
+        "support_line": trendline_res.get("support_line"),
         "swing_highs": trendline_res.get("swing_highs", []),
+        "swing_lows": trendline_res.get("swing_lows", []),
         "resistance": trendline_res.get("resistance"),
         "distance_pct": trendline_res.get("distance_pct"),
         "is_broken_out": trendline_res.get("is_broken_out", False),
         "is_recent_breakout": matches.get("trendline", False),
+        "multi_touch_meta": trendline_res.get("multi_touch_meta"),
         # Candlestick pattern overlay
         "annotated_patterns": pattern_res.get("annotated_patterns", []),
         "pattern_count": pattern_res.get("pattern_count", 0),

@@ -1276,3 +1276,26 @@
   }
 }
 
+/* Multi-Touch Trendline & Breakout Visuals */
+.anchor-pivot {
+  fill: #e11d48 !important;
+  stroke: #ffffff !important;
+  stroke-width: 2 !important;
+  filter: drop-shadow(0 0 5px rgba(225, 29, 72, 0.7));
+}
+.touch-pivot {
+  fill: #2563eb !important;
+  stroke: #ffffff !important;
+  stroke-width: 1.5 !important;
+  filter: drop-shadow(0 0 3px rgba(37, 99, 235, 0.5));
+}
+.trend-support-extended {
+  fill: none;
+  stroke: #10b981;
+  stroke-width: 2.2;
+}
+.breakout-badge-poly {
+  filter: drop-shadow(0 2px 4px rgba(22, 163, 74, 0.4));
+}
+
+
